@@ -31,9 +31,17 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint256 public constant MIN_MULTIPLIER_BPS = 15_000; // 1.50×
-    uint256 public constant MAX_MULTIPLIER_BPS = 30_000; // 3.00×
+    // ## Audit H001
+    uint256 public constant MAX_MULTIPLIER_BPS = 19_900; // 1.99×
     uint256 public constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant EMERGENCY_RESOLVE_DELAY = 2 minutes;
+    // ## Audit M001
+    uint256 public constant ROUND_DURATION = 5 minutes;
+    // ## Audit L002
+    // Hard cap on the total number of player slots per round across both sides
+    // (oddPlayers.length + evenPlayers.length). Bounds gas of resolveExternal —
+    // the resolve sweep iterates every slot, so an unbounded array can wedge
+    // the round if the loop exceeds the block gas limit.
+    uint256 public constant MAX_PLAYERS_PER_ROUND = 500;
 
     uint8 public constant ODD = 1;
     uint8 public constant EVEN = 2;
@@ -65,7 +73,9 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
     ///         Assigned by the backend; the contract only enforces that
     ///         successive round ids are strictly increasing.
     uint64 public currentRoundId;
-    uint256 public currentRandomWord;
+    // ## Audit M001, Audit L001
+    uint64 public currentRoundCloseTimestamp;
+    uint256 internal currentRandomWord;
 
     /// @notice Running per-side stake sums for the current cycle; reset on resolve.
     uint256 public oddStaked;
@@ -94,12 +104,16 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
         uint256 indexed roundId,
         address indexed player,
         uint8 pick,
-        uint256 amount
+        uint256 amount,
+        uint256 bettingPlayerCount
     );
+    event RoundClosed(uint256 indexed roundId);
     event ResolutionClosed(uint256 indexed roundId, uint256 vrfRequestId);
     event ResolvedInternal(uint256 indexed roundId, uint256 randomWord);
     event Resolved(
         uint256 indexed roundId,
+        uint256 indexed nextRoundId,
+        uint64 indexed nextCloseTimestamp,
         uint8 legs,
         uint8 side,
         uint8 result,
@@ -129,7 +143,21 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
     event PoolWalletUpdated(address indexed oldWallet, address indexed newWallet);
     event MultiplierUpdated(uint256 oldBps, uint256 newBps);
     event BetLimitsUpdated(uint256 minBet, uint256 maxBet);
-    event EmergencyResolved(uint64 indexed currentRoundId, uint256 totalRefunded);
+    event EmergencyResolved(
+        uint64 indexed currentRoundId,
+        uint256 indexed nextRoundId,
+        uint64 indexed nextCloseTimestamp,
+        uint256 totalRefunded
+    );
+
+    // ## Audit M001
+    event VRFWrongRequestId(
+        uint256 indexed roundId,
+        uint256 indexed requestId,
+        uint256 indexed vrfRequestId
+    );
+    event VRFNotDrawing(uint256 indexed roundId, uint256 indexed requestId);
+    event VRFAlreadyAwaitingCrossCheck(uint256 indexed roundId, uint256 indexed requestId);
 
     error BetTooSmall();
     error BetTooLarge();
@@ -141,12 +169,13 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
     error MultiplierOutOfRange();
     error MinExceedsMax();
     error ResolutionNotStuck();
-    error UnknownVrfRequest();
     error NothingToClaim();
     error InsufficientPool();
     error InvalidParameter();
     error NotAwaitingCrossCheck();
     error AlreadyAwaitingCrossCheck();
+    // ## Audit L002
+    error TooManyPlayers();
     // ZeroAddress is inherited from VRFConsumerBaseV2Plus.
 
     constructor(
@@ -192,6 +221,14 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
         multiplierBps = initialMultiplierBps;
         currentRoundId = initialRoundId_;
 
+        // ## Audit M001 — anchor first close to next 5-min UTC boundary.
+        // Unix epoch is UTC; 86400 = 288 * 300, so every 5-min UTC boundary is
+        // a multiple of ROUND_DURATION. This is the close deadline for the
+        // round currently open for betting.
+        currentRoundCloseTimestamp = uint64(
+            (block.timestamp / ROUND_DURATION + 1) * ROUND_DURATION
+        );
+
         emit PoolWalletUpdated(address(0), poolWallet_);
     }
 
@@ -209,19 +246,31 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
             prev = uint256(oddStakeOf[msg.sender]);
             newSum = prev + amount;
             if (newSum > maxBet) revert BetTooLarge();
-            if (prev == 0) oddPlayers.push(msg.sender);
+            if (prev == 0) {
+                // ## Audit L002
+                if (oddPlayers.length + evenPlayers.length >= MAX_PLAYERS_PER_ROUND) {
+                    revert TooManyPlayers();
+                }
+                oddPlayers.push(msg.sender);
+            }
             oddStakeOf[msg.sender] = uint96(newSum);
             oddStaked += amount;
         } else {
             prev = uint256(evenStakeOf[msg.sender]);
             newSum = prev + amount;
             if (newSum > maxBet) revert BetTooLarge();
-            if (prev == 0) evenPlayers.push(msg.sender);
+            if (prev == 0) {
+                // ## Audit L002
+                if (oddPlayers.length + evenPlayers.length >= MAX_PLAYERS_PER_ROUND) {
+                    revert TooManyPlayers();
+                }
+                evenPlayers.push(msg.sender);
+            }
             evenStakeOf[msg.sender] = uint96(newSum);
             evenStaked += amount;
         }
 
-        emit BetPlaced(currentRoundId, msg.sender, pick, amount);
+        emit BetPlaced(currentRoundId, msg.sender, pick, amount, oddPlayers.length + evenPlayers.length);
 
         token.safeTransferFrom(msg.sender, poolWallet, amount);
     }
@@ -247,18 +296,30 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
     }
 
     // ─── Resolution ───────────────────────────────────────────────────────
+    function closeRound() external onlyOwner {
+        if (isDrawing) revert AlreadyDrawing();
+        // ## Audit M001 — anchored to the round's scheduled 5-min boundary,
+        // not "previous close mining time + ROUND_DURATION", so a late close
+        // doesn't drift the next round's deadline.
+        if (block.timestamp < currentRoundCloseTimestamp) {
+            revert ResolutionNotStuck();
+        }
 
-    function closeAndRequestRandomness(uint64 _nextRoundId)
+        isDrawing = true;
+        drawingStartedAt = uint64(block.timestamp);
+
+        emit RoundClosed(currentRoundId);
+    }
+
+
+    function requestRandomness(uint64 _nextRoundId)
         external
         onlyOwner
         nonReentrant
         returns (uint256 requestId)
     {
-        if (isDrawing) revert AlreadyDrawing();
+        if (!isDrawing) revert NotDrawing();
         if (_nextRoundId <= currentRoundId) revert InvalidParameter();
-
-        isDrawing = true;
-        drawingStartedAt = uint64(block.timestamp);
 
         requestId = s_vrfCoordinator.requestRandomWords(
             VRFV2PlusClient.RandomWordsRequest({
@@ -282,20 +343,27 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
         uint256 requestId,
         uint256[] calldata randomWords
     ) internal override {
-        if (requestId != vrfRequestId) revert UnknownVrfRequest();
-        _commitRandomWord(randomWords[0]);
-    }
+        if (requestId != vrfRequestId) {
+            // ## Audit M001
+            emit VRFWrongRequestId(currentRoundId, requestId, vrfRequestId);
+            return;
+        }
+        if (!isDrawing) {
+            // ## Audit M001
+            emit VRFNotDrawing(currentRoundId, requestId);
+            return;
+        }
 
-    /// @dev Commits the random word to storage; `resolveExternal` will
-    ///      combine it with the owner-supplied legs to derive side/result.
-    function _commitRandomWord(uint256 randomWord) internal {
-        if (!isDrawing) revert NotDrawing();
-        if (awaitingCrossCheck) revert AlreadyAwaitingCrossCheck();
+        if (awaitingCrossCheck) {
+            // ## Audit M001
+            emit VRFAlreadyAwaitingCrossCheck(currentRoundId, requestId);
+            return;
+        }
 
-        currentRandomWord = randomWord;
+        currentRandomWord = randomWords[0];
         awaitingCrossCheck = true;
 
-        emit ResolvedInternal(currentRoundId, randomWord);
+        emit ResolvedInternal(currentRoundId, currentRandomWord);
     }
 
     /// @notice Owner cross-check + finalize. `_randomWord` + `_currentRoundId`
@@ -318,8 +386,8 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
         // 사다리 traversal must agree: LEFT + 3 legs → EVEN, etc.
         // Legs is derived from an unused bit of the same random word so the
         // owner cannot choose it after seeing the result.
-        uint8 derivedSide = (_randomWord & 1) == 1 ? LEFT : RIGHT;
-        uint8 derivedLegs = THREE_LEGS + uint8((_randomWord >> 8) & 1);
+        uint8 derivedSide = (currentRandomWord & 1) == 1 ? LEFT : RIGHT;
+        uint8 derivedLegs = THREE_LEGS + uint8((currentRandomWord >> 8) & 1);
         uint8 derivedResult = derivedSide == LEFT
             ? (derivedLegs == THREE_LEGS ? EVEN : ODD)
             : (derivedLegs == FOUR_LEGS ? EVEN : ODD);
@@ -330,20 +398,35 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
 
         if (totalStaked > 0) {
             if (derivedResult == ODD) {
-                paid = _creditAndClear(oddPlayers, oddStakeOf, mult, _currentRoundId, ODD);
-                _clearSide(evenPlayers, evenStakeOf, _currentRoundId, EVEN);
+                paid = _creditAndClear(oddPlayers, oddStakeOf, mult, currentRoundId, ODD);
+                _clearSide(evenPlayers, evenStakeOf, currentRoundId, EVEN);
             } else {
-                paid = _creditAndClear(evenPlayers, evenStakeOf, mult, _currentRoundId, EVEN);
-                _clearSide(oddPlayers, oddStakeOf, _currentRoundId, ODD);
+                paid = _creditAndClear(evenPlayers, evenStakeOf, mult, currentRoundId, EVEN);
+                _clearSide(oddPlayers, oddStakeOf, currentRoundId, ODD);
             }
         }
 
+
+        // ## Audit M001 — advance to the next 5-min UTC boundary.
+        // Normal cadence: previous deadline + ROUND_DURATION.
+        // Catchup (VRF stall, server downtime): if that's already in the past,
+        // jump forward to the next boundary from chain time so close can fire
+        // immediately on the next tick.
+        uint64 nextClose = currentRoundCloseTimestamp + uint64(ROUND_DURATION);
+        if (nextClose <= block.timestamp) {
+            nextClose = uint64(
+                (block.timestamp / ROUND_DURATION + 1) * ROUND_DURATION
+            );
+        }
+
         emit Resolved(
-            _currentRoundId,
+            currentRoundId,
+            _nextRoundId,
+            nextClose,
             derivedLegs,
             derivedSide,
             derivedResult,
-            _randomWord,
+            currentRandomWord,
             totalStaked,
             paid
         );
@@ -361,6 +444,8 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
 
         isDrawing = false;
         currentRoundId = _nextRoundId;
+
+        currentRoundCloseTimestamp = nextClose;
     }
 
     /// @dev Credit every winner from their cumulative stake at rate `mult`,
@@ -470,23 +555,40 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
     }
 
     /// @notice Escape hatch when VRF or the resolve flow is stuck past
-    ///         `EMERGENCY_RESOLVE_DELAY`. Refunds every bettor at 1× their
+    ///         `ROUND_DURATION`. Refunds every bettor at 1× their
     ///         stake into `winnings` and clears cycle state. No randomness
     ///         used — safe regardless of whether VRF already committed.
     function emergencyResolve(uint64 _nextRoundId) external onlyOwner nonReentrant {
         if (!isDrawing) revert NotDrawing();
         if (_nextRoundId <= currentRoundId) revert InvalidParameter();
-        if (block.timestamp < drawingStartedAt + EMERGENCY_RESOLVE_DELAY) {
+        // ## Audit M001, ## Audit L001
+        // Emergency only fires when the round has been open at least one full
+        // ROUND_DURATION past its scheduled close — drift-free, anchored to
+        // currentRoundCloseTimestamp like closeRound itself.
+        if (block.timestamp < currentRoundCloseTimestamp + ROUND_DURATION) {
             revert ResolutionNotStuck();
         }
 
         // --- Refund ---
-        uint64 rid = currentRoundId;
-        uint256 refunded = _refundAndClear(oddPlayers, oddStakeOf, rid, ODD);
-        refunded += _refundAndClear(evenPlayers, evenStakeOf, rid, EVEN);
+        uint256 refunded = _refundAndClear(oddPlayers, oddStakeOf, currentRoundId, ODD);
+        refunded += _refundAndClear(evenPlayers, evenStakeOf, currentRoundId, EVEN);
+
+
+        // ## Audit M001 — same advance pattern as resolveExternal.
+        uint64 nextClose = currentRoundCloseTimestamp + uint64(ROUND_DURATION);
+        if (nextClose <= block.timestamp) {
+            nextClose = uint64(
+                (block.timestamp / ROUND_DURATION + 1) * ROUND_DURATION
+            );
+        }
 
         // --- Event ---
-        emit EmergencyResolved(rid, refunded);
+        emit EmergencyResolved(
+            currentRoundId,
+            _nextRoundId,
+            nextClose,
+            refunded
+        );
 
         // --- 초기화 ---
         delete oddPlayers;
@@ -500,6 +602,8 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
 
         isDrawing = false;
         currentRoundId = _nextRoundId;
+
+        currentRoundCloseTimestamp = nextClose;
     }
 
     // ───────── Views ─────────
@@ -572,7 +676,10 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
             uint256 oddPlayerCount,
             uint256 evenPlayerCount,
             uint8 lastResult_,
-            uint64 drawingStartedAt_
+            uint64 drawingStartedAt_,
+            uint256 bettingPlayerCount,
+            uint64 currentRoundCloseTimestamp_,
+            uint256 currentRandomWord_
         )
     {
         return (
@@ -584,7 +691,10 @@ contract SpaceLadderBettingV7 is VRFConsumerBaseV2Plus, ReentrancyGuard {
             oddPlayers.length,
             evenPlayers.length,
             lastResult,
-            drawingStartedAt
+            drawingStartedAt,
+            oddPlayers.length + evenPlayers.length,
+            currentRoundCloseTimestamp,
+            currentRandomWord
         );
     }
 
